@@ -175,6 +175,44 @@ def test_agent_stream_keeps_credentials_out_of_checkpoints_and_separates_threads
     assert all(secret not in persisted for secret in ['visitor-first', 'visitor-second', 'visitor-jev'])
 
 
+def test_agent_allows_more_steps_than_the_langgraph_default():
+    from langgraph.graph import StateGraph, MessagesState, START, END
+    from src.credentials import CredentialScopedAgent, RECURSION_LIMIT
+
+    builder = StateGraph(MessagesState)
+    builder.add_node('answer', lambda state: {})
+    builder.add_edge(START, 'answer')
+    builder.add_edge('answer', END)
+    adapter = CredentialScopedAgent(name='test', graph=builder.compile())
+    assert RECURSION_LIMIT > 25
+    assert adapter.config['recursion_limit'] == RECURSION_LIMIT
+    assert adapter.clone().config['recursion_limit'] == RECURSION_LIMIT
+
+
+def test_runaway_tool_loop_ends_with_a_visible_error():
+    from ag_ui.core import EventType, RunAgentInput
+    from langchain_core.messages import AIMessage
+    from langgraph.graph import StateGraph, MessagesState, START
+    from src.bounded_memory_saver import BoundedMemorySaver
+    from src.credentials import CredentialScopedAgent
+
+    builder = StateGraph(MessagesState)
+    builder.add_node('loop', lambda state: {'messages': [AIMessage(content='again')]})
+    builder.add_edge(START, 'loop')
+    builder.add_edge('loop', 'loop')
+    adapter = CredentialScopedAgent(
+        name='test', graph=builder.compile(checkpointer=BoundedMemorySaver()), config={'recursion_limit': 3}
+    )
+    input = RunAgentInput(thread_id='loop', run_id='run', messages=[{'id': 'm', 'role': 'user', 'content': 'Hello'}], state={}, tools=[], context=[], forwarded_props={})
+
+    async def exercise():
+        return [event async for event in adapter.run(input)]
+
+    events = asyncio.run(exercise())
+    assert events[-1].type == EventType.RUN_ERROR
+    assert events[-1].code == 'recursion_limit'
+
+
 def test_main_starts_without_server_credentials(monkeypatch):
     import subprocess
     import sys

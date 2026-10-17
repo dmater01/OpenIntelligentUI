@@ -9,7 +9,9 @@ import json
 import os
 
 import httpx
+from ag_ui.core import EventType, RunErrorEvent
 from copilotkit import LangGraphAGUIAgent
+from langgraph.errors import GraphRecursionError
 from langsmith import tracing_context
 from starlette.responses import JSONResponse
 
@@ -88,15 +90,31 @@ def private_thread_id(thread_id):
     return namespace + ':' + hmac.new(key, thread_id.encode(), hashlib.sha256).hexdigest()
 
 
+# AG-UI passes LangGraph's default limit of 25, which overrides deepagents' own.
+# Smaller models read skills and plan before answering and can need more steps.
+RECURSION_LIMIT = 100
+
+
 class CredentialScopedAgent(LangGraphAGUIAgent):
+    def __init__(self, *, config=None, **kwargs):
+        super().__init__(config={'recursion_limit': RECURSION_LIMIT, **(config or {})}, **kwargs)
+
     async def run(self, input):
         original = input.thread_id
         scoped = input.model_copy(update={'thread_id': private_thread_id(original)})
-        async for event in super().run(scoped):
-            # The wire protocol retains the client ID; only graph storage sees the private ID.
-            if hasattr(event, 'thread_id'):
-                event = event.model_copy(update={'thread_id': original})
-            yield event
+        try:
+            async for event in super().run(scoped):
+                # The wire protocol retains the client ID; only graph storage sees the private ID.
+                if hasattr(event, 'thread_id'):
+                    event = event.model_copy(update={'thread_id': original})
+                yield event
+        except GraphRecursionError:
+            # Otherwise the stream just closes and the chat shows nothing.
+            yield RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                message='The answer took too many steps. Please retry.',
+                code='recursion_limit',
+            )
 
 
 async def validate_credentials(credentials):
